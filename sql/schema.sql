@@ -235,7 +235,7 @@ FROM (VALUES
   ('owner','suppliers.read'),('owner','stock.read'),('owner','purchases.read'),('owner','orders.read'),
   ('owner','sales.read'),('owner','reports.view'),('owner','analytics.view'),
 
-  ('product_manager','products.read'),('product_manager','products.write'),
+  ('product_manager','products.read'),('product_manager','products.write'),('product_manager','stock.read'),
   ('product_manager','categories.read'),('product_manager','categories.write'),
   ('product_manager','suppliers.read'),('product_manager','reports.view'),('product_manager','analytics.view'),
 
@@ -277,3 +277,14 @@ ALTER TABLE stock_transactions  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notifications       ENABLE ROW LEVEL SECURITY;
 ALTER TABLE activity_logs       ENABLE ROW LEVEL SECURITY;
 ALTER TABLE support_requests    ENABLE ROW LEVEL SECURITY;
+
+-- Staff check-in / check-out: one row per person per day.
+CREATE TABLE IF NOT EXISTS work_shifts (
+  shift_id BIGSERIAL PRIMARY KEY,
+  user_id       BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+  work_date     DATE NOT NULL,
+  check_in      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  check_out     TIMESTAMPTZ,
+  UNIQUE (user_id, work_date)
+);
+ALTER TABLE work_shifts ENABLE ROW LEVEL SECURITY;

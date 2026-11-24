@@ -50,6 +50,7 @@ app.use('/api/orders', require('./routes/orders'));
 app.use('/api/sales', require('./routes/sales'));
 app.use('/api', require('./routes/reports'));
 app.use('/api', require('./routes/common'));
+app.use('/api/shifts', require('./routes/shifts'));
 
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Route not found' }));
 
