@@ -146,3 +146,26 @@ The API runs anywhere Node.js runs (Render, Railway, AWS, a VPS).
 - Stock changes run in database transactions with row locks, so two sales cannot oversell the same item.
 - Deactivated accounts are refused on their next request, even with a valid token.
 - CSV exports neutralise spreadsheet formula injection.
+
+## Run with Docker
+
+The API runs in a container and connects to your Supabase database. No database runs in Docker.
+
+```bash
+cp .env.example .env                      # fill in DATABASE_URL (Supabase) and JWT_SECRET
+docker compose up --build -d              # API on http://localhost:5000
+docker compose run --rm api npm run db:setup   # first time only: create the tables
+docker compose run --rm api npm run db:demo    # optional: demo users and sample data
+docker compose logs -f api                # watch the logs
+```
+
+Or without compose:
+
+```bash
+docker build -t inventory-api .
+docker run -d -p 5000:5000 --env-file .env -v inventory_uploads:/app/uploads inventory-api
+```
+
+On Render, choose **Docker** as the runtime and set the environment variables
+(`DATABASE_URL`, `JWT_SECRET`, `DB_SSL=true`, `CORS_ORIGINS`). Render supplies `PORT` itself.
+Never put `.env` inside the image or in GitHub.

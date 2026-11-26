@@ -1,89 +1,70 @@
 const express = require('express');
 const { query } = require('../db');
-const { HttpError, wrap, toCsv } = require('../utils/helpers');
-const { authenticate } = require('../middleware/auth');
+const { HttpError, wrap } = require('../utils/helpers');
+const { authenticate, requirePerm } = require('../middleware/auth');
 
+// Owner check-in / check-out. Events are stored in activity_logs (no separate table).
+// One day can have many sessions: check in, check out, check in again, and so on.
 const router = express.Router();
-router.use(authenticate);
+router.use(authenticate, requirePerm('users.manage'));
 
-// Work days follow India time, so a check-in late at night is recorded on the right day.
-const TODAY = "(now() AT TIME ZONE 'Asia/Kolkata')::date";
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const DAY = "(created_at AT TIME ZONE 'Asia/Kolkata')::date = (now() AT TIME ZONE 'Asia/Kolkata')::date";
 
-const seesEveryone = (req) => req.user.permissions.includes('users.manage');
-
-const SELECT = `
-  SELECT a.attendance_id, a.user_id, u.full_name, a.work_date, a.check_in, a.check_out,
-         CASE WHEN a.check_out IS NULL THEN NULL
-              ELSE ROUND((EXTRACT(EPOCH FROM (a.check_out - a.check_in)) / 3600)::numeric, 2)
-         END AS hours
-  FROM attendance a JOIN users u ON u.user_id = a.user_id`;
-
-function listFilters(req) {
-  const params = [];
-  const conds = [];
-  const add = (v) => { params.push(v); return `$${params.length}`; };
-  if (seesEveryone(req)) {
-    if (req.query.user_id) conds.push(`a.user_id = ${add(Number(req.query.user_id))}`);
-  } else {
-    conds.push(`a.user_id = ${add(req.user.user_id)}`);
+async function todayState(userId) {
+  const { rows } = await query(
+    `SELECT action, created_at FROM activity_logs
+     WHERE user_id = $1 AND action IN ('check_in', 'check_out') AND ${DAY}
+     ORDER BY created_at`,
+    [userId]
+  );
+  // Pair each check_in with the check_out that closes it.
+  const sessions = [];
+  let open = null;
+  for (const r of rows) {
+    if (r.action === 'check_in' && !open) open = r.created_at;
+    else if (r.action === 'check_out' && open) {
+      sessions.push({ check_in: open, check_out: r.created_at });
+      open = null;
+    }
   }
-  if (req.query.from) {
-    if (!DATE_RE.test(req.query.from)) throw new HttpError(400, 'Use the from date as YYYY-MM-DD');
-    conds.push(`a.work_date >= ${add(req.query.from)}`);
-  }
-  if (req.query.to) {
-    if (!DATE_RE.test(req.query.to)) throw new HttpError(400, 'Use the to date as YYYY-MM-DD');
-    conds.push(`a.work_date <= ${add(req.query.to)}`);
-  }
-  return { where: conds.length ? `WHERE ${conds.join(' AND ')}` : '', params };
+  if (open) sessions.push({ check_in: open, check_out: null });
+
+  const closed = sessions.filter((s) => s.check_out);
+  const minutes = Math.round(
+    closed.reduce((sum, s) => sum + (new Date(s.check_out) - new Date(s.check_in)), 0) / 60000
+  );
+  const last = sessions[sessions.length - 1] || null;
+  return {
+    check_in: last ? last.check_in : null,   // start of the latest session
+    check_out: last ? last.check_out : null, // end of the latest session (null while working)
+    working: !!open,                         // true when checked in and not yet checked out
+    sessions: sessions.length,
+    minutes,                                 // total minutes worked today (closed sessions)
+  };
 }
 
-// Today's record for the signed-in user (null if not checked in yet).
 router.get('/today', wrap(async (req, res) => {
-  const { rows } = await query(
-    `SELECT attendance_id, work_date, check_in, check_out FROM attendance
-     WHERE user_id = $1 AND work_date = ${TODAY}`, [req.user.user_id]);
-  res.json({ item: rows[0] || null });
+  res.json({ item: await todayState(req.user.user_id) });
 }));
 
 router.post('/check-in', wrap(async (req, res) => {
-  const { rows } = await query(
-    `INSERT INTO attendance (user_id, work_date) VALUES ($1, ${TODAY})
-     ON CONFLICT (user_id, work_date) DO NOTHING RETURNING attendance_id, work_date, check_in, check_out`,
-    [req.user.user_id]);
-  if (!rows.length) throw new HttpError(409, 'You have already checked in today');
-  res.status(201).json({ item: rows[0] });
+  const state = await todayState(req.user.user_id);
+  if (state.working) throw new HttpError(409, 'You are already checked in. Check out first.');
+  await query(
+    `INSERT INTO activity_logs (user_id, action, entity, ip_address) VALUES ($1, 'check_in', 'attendance', $2)`,
+    [req.user.user_id, req.ip || null]
+  );
+  res.status(201).json({ item: await todayState(req.user.user_id) });
 }));
 
 router.post('/check-out', wrap(async (req, res) => {
-  const { rows } = await query(
-    `UPDATE attendance SET check_out = now()
-     WHERE user_id = $1 AND work_date = ${TODAY} AND check_out IS NULL
-     RETURNING attendance_id, work_date, check_in, check_out`,
-    [req.user.user_id]);
-  if (!rows.length) throw new HttpError(409, 'Check in first, or you have already checked out today');
-  res.json({ item: rows[0] });
-}));
-
-// Owner sees everyone (optionally one person); other staff see only their own records.
-router.get('/', wrap(async (req, res) => {
-  const { where, params } = listFilters(req);
-  const { rows } = await query(`${SELECT} ${where} ORDER BY a.work_date DESC, u.full_name LIMIT 500`, params);
-  res.json({ items: rows, total: rows.length });
-}));
-
-router.get('/export', wrap(async (req, res) => {
-  const { where, params } = listFilters(req);
-  const { rows } = await query(`${SELECT} ${where} ORDER BY a.work_date DESC, u.full_name`, params);
-  const csv = toCsv([
-    { key: 'full_name', label: 'Name' },
-    { key: 'work_date', label: 'Date' },
-    { key: 'check_in', label: 'Check in' },
-    { key: 'check_out', label: 'Check out' },
-    { key: 'hours', label: 'Hours' },
-  ], rows);
-  res.attachment('attendance.csv').send(csv);
+  const state = await todayState(req.user.user_id);
+  if (!state.working) throw new HttpError(409, 'Check in first');
+  await query(
+    `INSERT INTO activity_logs (user_id, action, entity, ip_address) VALUES ($1, 'check_out', 'attendance', $2)`,
+    [req.user.user_id, req.ip || null]
+  );
+  res.json({ item: await todayState(req.user.user_id) });
 }));
 
 module.exports = router;
